@@ -142,11 +142,17 @@ public class NotificationsController extends BaseController {
     }
     
     private static volatile NotificationsController[] Instance = new NotificationsController[UserConfig.MAX_ACCOUNT_COUNT];
+    private static final Object[] lockObjects = new Object[UserConfig.MAX_ACCOUNT_COUNT];
+    static {
+        for (int i = 0; i < UserConfig.MAX_ACCOUNT_COUNT; i++) {
+            lockObjects[i] = new Object();
+        }
+    }
 
     public static NotificationsController getInstance(int num) {
         NotificationsController localInstance = Instance[num];
         if (localInstance == null) {
-            synchronized (NotificationsController.class) {
+            synchronized (lockObjects[num]) {
                 localInstance = Instance[num];
                 if (localInstance == null) {
                     Instance[num] = localInstance = new NotificationsController(num);
@@ -3775,7 +3781,7 @@ public class NotificationsController extends BaseController {
                             sound = Settings.System.DEFAULT_NOTIFICATION_URI;
                         } else {
                             if (isInternalSoundFile) {
-                                sound = FileProvider.getUriForFile(ApplicationLoader.applicationContext, BuildConfig.APPLICATION_ID + ".provider", new File(soundPath));
+                                sound = FileProvider.getUriForFile(ApplicationLoader.applicationContext, ApplicationLoader.getApplicationId() + ".provider", new File(soundPath));
                                 ApplicationLoader.applicationContext.grantUriPermission("com.android.systemui", sound, Intent.FLAG_GRANT_READ_URI_PERMISSION);
                             } else {
                                 sound = Uri.parse(soundPath);
@@ -3787,7 +3793,7 @@ public class NotificationsController extends BaseController {
                         } else {
                             if (Build.VERSION.SDK_INT >= 24 && soundPath.startsWith("file://") && !AndroidUtilities.isInternalUri(Uri.parse(soundPath))) {
                                 try {
-                                    Uri uri = FileProvider.getUriForFile(ApplicationLoader.applicationContext, BuildConfig.APPLICATION_ID + ".provider", new File(soundPath.replace("file://", "")));
+                                    Uri uri = FileProvider.getUriForFile(ApplicationLoader.applicationContext, ApplicationLoader.getApplicationId() + ".provider", new File(soundPath.replace("file://", "")));
                                     ApplicationLoader.applicationContext.grantUriPermission("com.android.systemui", uri, Intent.FLAG_GRANT_READ_URI_PERMISSION);
                                     mBuilder.setSound(uri, AudioManager.STREAM_NOTIFICATION);
                                 } catch (Exception e) {
@@ -4292,7 +4298,7 @@ public class NotificationsController extends BaseController {
                             Uri uri;
                             if (attach.exists()) {
                                 try {
-                                    uri = FileProvider.getUriForFile(ApplicationLoader.applicationContext, BuildConfig.APPLICATION_ID + ".provider", attach);
+                                    uri = FileProvider.getUriForFile(ApplicationLoader.applicationContext, ApplicationLoader.getApplicationId() + ".provider", attach);
                                 } catch (Exception e) {
                                     FileLog.e(e);
                                     uri = null;
@@ -4300,7 +4306,7 @@ public class NotificationsController extends BaseController {
                             } else if (getFileLoader().isLoadingFile(attach.getName())) {
                                 Uri.Builder _uri = new Uri.Builder()
                                         .scheme("content")
-                                        .authority(NotificationImageProvider.AUTHORITY)
+                                        .authority(NotificationImageProvider.getAuthority())
                                         .appendPath("msg_media_raw")
                                         .appendPath(currentAccount + "")
                                         .appendPath(attach.getName())
@@ -4333,7 +4339,7 @@ public class NotificationsController extends BaseController {
                             Uri uri;
                             if (Build.VERSION.SDK_INT >= 24) {
                                 try {
-                                    uri = FileProvider.getUriForFile(ApplicationLoader.applicationContext, BuildConfig.APPLICATION_ID + ".provider", f);
+                                    uri = FileProvider.getUriForFile(ApplicationLoader.applicationContext, ApplicationLoader.getApplicationId() + ".provider", f);
                                 } catch (Exception ignore) {
                                     uri = null;
                                 }

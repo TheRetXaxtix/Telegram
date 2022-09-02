@@ -21,7 +21,7 @@ public class FilePathDatabase {
     private File cacheFile;
     private File shmCacheFile;
 
-    private final static int LAST_DB_VERSION = 1;
+    private final static int LAST_DB_VERSION = 2;
 
     private final static String DATABASE_NAME = "file_to_path";
     private final static String DATABASE_BACKUP_NAME = "file_to_path_backup";
@@ -57,15 +57,17 @@ public class FilePathDatabase {
 
             if (createTable) {
                 database.executeFast("CREATE TABLE paths(document_id INTEGER, dc_id INTEGER, type INTEGER, path TEXT, PRIMARY KEY(document_id, dc_id, type));").stepThis().dispose();
+                database.executeFast("CREATE INDEX IF NOT EXISTS path_in_paths ON paths(path);").stepThis().dispose();
                 database.executeFast("PRAGMA user_version = " + LAST_DB_VERSION).stepThis().dispose();
             } else {
                 int version = database.executeInt("PRAGMA user_version");
                 if (BuildVars.LOGS_ENABLED) {
-                    FileLog.d("current db version = " + version);
+                    FileLog.d("current files db version = " + version);
                 }
                 if (version == 0) {
                     throw new Exception("malformed");
                 }
+                migrateDatabase(version);
                 //migration
             }
             if (!fromBackup) {
@@ -86,6 +88,14 @@ public class FilePathDatabase {
             if (BuildVars.DEBUG_VERSION) {
                 FileLog.e(e);
             }
+        }
+    }
+
+    private void migrateDatabase(int version) throws SQLiteException {
+        if (version == 1) {
+            database.executeFast("CREATE INDEX IF NOT EXISTS path_in_paths ON paths(path);").stepThis().dispose();
+            database.executeFast("PRAGMA user_version = " + 2).stepThis().dispose();
+            version = 2;
         }
     }
 
@@ -117,7 +127,7 @@ public class FilePathDatabase {
         try {
             return AndroidUtilities.copyFile(backupCacheFile, cacheFile);
         } catch (IOException e) {
-           FileLog.e(e);
+            FileLog.e(e);
         }
         return false;
     }
@@ -140,10 +150,16 @@ public class FilePathDatabase {
                     cursor = database.queryFinalized("SELECT path FROM paths WHERE document_id = " + documentId + " AND dc_id = " + dc + " AND type = " + type);
                     if (cursor.next()) {
                         res[0] = cursor.stringValue(0);
+                        if (BuildVars.DEBUG_VERSION) {
+                            FileLog.d("get file path id=" + documentId + " dc=" + dc + " type=" + type + " path=" + res[0]);
+                        }
                     }
-                    cursor.dispose();
                 } catch (SQLiteException e) {
                     FileLog.e(e);
+                } finally {
+                    if (cursor != null) {
+                        cursor.dispose();
+                    }
                 }
                 syncLatch.countDown();
             });
@@ -159,10 +175,16 @@ public class FilePathDatabase {
                 cursor = database.queryFinalized("SELECT path FROM paths WHERE document_id = " + documentId + " AND dc_id = " + dc + " AND type = " + type);
                 if (cursor.next()) {
                     res = cursor.stringValue(0);
+                    if (BuildVars.DEBUG_VERSION) {
+                        FileLog.d("get file path id=" + documentId + " dc=" + dc + " type=" + type + " path=" + res);
+                    }
                 }
-                cursor.dispose();
             } catch (SQLiteException e) {
                 FileLog.e(e);
+            } finally {
+                if (cursor != null) {
+                    cursor.dispose();
+                }
             }
             return res;
         }
@@ -170,9 +192,17 @@ public class FilePathDatabase {
 
     public void putPath(long id, int dc, int type, String path) {
         dispatchQueue.postRunnable(() -> {
+            if (BuildVars.DEBUG_VERSION) {
+                FileLog.d("put file path id=" + id + " dc=" + dc + " type=" + type + " path=" + path);
+            }
             SQLitePreparedStatement state = null;
+            SQLitePreparedStatement deleteState = null;
             try {
                 if (path != null) {
+                    deleteState = database.executeFast("DELETE FROM paths WHERE path = ?");
+                    deleteState.bindString(1, path);
+                    deleteState.step();
+
                     state = database.executeFast("REPLACE INTO paths VALUES(?, ?, ?, ?)");
                     state.requery();
                     state.bindLong(1, id);
@@ -180,11 +210,19 @@ public class FilePathDatabase {
                     state.bindInteger(3, type);
                     state.bindString(4, path);
                     state.step();
+                    state.dispose();
                 } else {
                     database.executeFast("DELETE FROM paths WHERE document_id = " + id + " AND dc_id = " + dc + " AND type = " + type).stepThis().dispose();
                 }
             } catch (SQLiteException e) {
                 FileLog.e(e);
+            } finally {
+                if (deleteState != null) {
+                    deleteState.dispose();
+                }
+                if (state != null) {
+                    state.dispose();
+                }
             }
         });
     }
@@ -222,6 +260,39 @@ public class FilePathDatabase {
                 FileLog.e(new Exception("warning, not allowed in main thread"));
             }
         }
+    }
+
+    public void clear() {
+        dispatchQueue.postRunnable(() -> {
+            try {
+                database.executeFast("DELETE FROM paths WHERE 1").stepThis().dispose();
+            } catch (SQLiteException e) {
+                FileLog.e(e);
+            }
+        });
+    }
+
+    public boolean hasAnotherRefOnFile(String path) {
+        CountDownLatch syncLatch = new CountDownLatch(1);
+        boolean[] res = new boolean[]{false};
+        dispatchQueue.postRunnable(() -> {
+            try {
+                SQLiteCursor cursor = database.queryFinalized("SELECT document_id FROM paths WHERE path = '" + path + "'");
+                if (cursor.next()) {
+                    res[0] = true;
+                }
+            } catch (Exception e) {
+                FileLog.e(e);
+            }
+            syncLatch.countDown();
+        });
+
+        try {
+            syncLatch.await();
+        } catch (InterruptedException e) {
+            FileLog.e(e);
+        }
+        return res[0];
     }
 
     public static class PathData {

@@ -46,6 +46,8 @@ public class FileLoadOperation {
         }
     }
 
+    private static final Object lockObject = new Object();
+
     private static class PreloadRange {
         private long fileOffset;
         private long length;
@@ -62,14 +64,19 @@ public class FileLoadOperation {
     private final static int stateDownloading = 1;
     private final static int stateFailed = 2;
     private final static int stateFinished = 3;
+    private final static int stateCanceled = 4;
 
     private int downloadChunkSize = 1024 * 32;
     private int downloadChunkSizeBig = 1024 * 128;
     private int cdnChunkCheckSize = 1024 * 128;
     private int maxDownloadRequests = 4;
     private int maxDownloadRequestsBig = 4;
-    private int bigFileSizeFrom = 1024 * 1024;
+    private int bigFileSizeFrom = 10 * 1024 * 1024;
     private int maxCdnParts = (int) (FileLoader.DEFAULT_MAX_FILE_SIZE / downloadChunkSizeBig);
+
+    //load small parts for stream
+    private int downloadChunkSizeAnimation = 1024 * 128;
+    private int maxDownloadRequestsAnimation = 4;
 
     private final static int preloadMaxBytes = 2 * 1024 * 1024;
 
@@ -134,7 +141,7 @@ public class FileLoadOperation {
 
     private HashMap<Long, TLRPC.TL_fileHash> cdnHashes;
 
-    private boolean forceBig;
+    private boolean isStream;
 
     private byte[] encryptKey;
     private byte[] encryptIv;
@@ -172,12 +179,14 @@ public class FileLoadOperation {
 
     private int currentType;
     public FilePathDatabase.PathData pathSaveData;
+    private long startTime;
 
     public interface FileLoadOperationDelegate {
         void didFinishLoadingFile(FileLoadOperation operation, File finalFile);
         void didFailedLoadingFile(FileLoadOperation operation, int state);
         void didChangedLoadProgress(FileLoadOperation operation, long uploadedSize, long totalSize);
         void saveFilePath(FilePathDatabase.PathData pathSaveData, File cacheFileFinal);
+        boolean hasAnotherRefOnFile(String path);
     }
 
     private void updateParams() {
@@ -196,7 +205,7 @@ public class FileLoadOperation {
     public FileLoadOperation(ImageLocation imageLocation, Object parent, String extension, long size) {
         updateParams();
         parentObject = parent;
-        forceBig = imageLocation.imageType == FileLoader.IMAGE_TYPE_ANIMATION;
+        isStream = imageLocation.imageType == FileLoader.IMAGE_TYPE_ANIMATION;
         if (imageLocation.isEncrypted()) {
             location = new TLRPC.TL_inputEncryptedFileLocation();
             location.id = imageLocation.location.volume_id;
@@ -580,7 +589,7 @@ public class FileLoadOperation {
         return progress + getDownloadedLengthFromOffsetInternal(ranges, (int) (totalBytesCount * progress), totalBytesCount) / (float) totalBytesCount;
     }
 
-    protected long[] getDownloadedLengthFromOffset(final int offset, final long length) {
+    protected long[] getDownloadedLengthFromOffset(final long offset, final long length) {
         final CountDownLatch countDownLatch = new CountDownLatch(1);
         final long[] result = new long[2];
         Utilities.stageQueue.postRunnable(() -> {
@@ -630,10 +639,15 @@ public class FileLoadOperation {
     }
 
     public boolean start(final FileLoadOperationStream stream, final long streamOffset, final boolean steamPriority) {
+        startTime = System.currentTimeMillis();
         updateParams();
         if (currentDownloadChunkSize == 0) {
-            currentDownloadChunkSize = totalBytesCount >= bigFileSizeFrom || forceBig ? downloadChunkSizeBig : downloadChunkSize;
-            currentMaxDownloadRequests = totalBytesCount >= bigFileSizeFrom || forceBig ? maxDownloadRequestsBig : maxDownloadRequests;
+            if (isStream) {
+                currentDownloadChunkSize = downloadChunkSizeAnimation;
+                currentMaxDownloadRequests = maxDownloadRequestsAnimation;
+            }
+            currentDownloadChunkSize = totalBytesCount >= bigFileSizeFrom || isStream ? downloadChunkSizeBig : downloadChunkSize;
+            currentMaxDownloadRequests = totalBytesCount >= bigFileSizeFrom || isStream ? maxDownloadRequestsBig : maxDownloadRequests;
         }
         final boolean alreadyStarted = state != stateIdle;
         final boolean wasPaused = paused;
@@ -770,11 +784,17 @@ public class FileLoadOperation {
             TLRPC.TL_theme theme = (TLRPC.TL_theme) parentObject;
             cacheFileFinal = new File(ApplicationLoader.getFilesDirFixed(), "remote" + theme.id + ".attheme");
         } else {
-            cacheFileFinal = new File(storePath, storeFileName);
+            if (!encryptFile) {
+                cacheFileFinal = new File(storePath, storeFileName);
+            } else {
+                cacheFileFinal = new File(storePath, fileNameFinal);
+            }
         }
         boolean finalFileExist = cacheFileFinal.exists();
         if (finalFileExist && (parentObject instanceof TLRPC.TL_theme || totalBytesCount != 0 && totalBytesCount != cacheFileFinal.length())) {
-            cacheFileFinal.delete();
+            if (!delegate.hasAnotherRefOnFile(cacheFileFinal.toString())) {
+                cacheFileFinal.delete();
+            }
             finalFileExist = false;
         }
 
@@ -1253,18 +1273,20 @@ public class FileLoadOperation {
                     } else {
                         try {
                             if (pathSaveData != null) {
-                                cacheFileFinal = new File(storePath, storeFileName);
-                                int count = 1;
-                                while (cacheFileFinal.exists()) {
-                                    int lastDotIndex = storeFileName.lastIndexOf('.');
-                                    String newFileName;
-                                    if (lastDotIndex > 0) {
-                                        newFileName = storeFileName.substring(0, lastDotIndex) + " (" + count + ")" + storeFileName.substring(lastDotIndex);
-                                    } else {
-                                        newFileName = storeFileName + " (" + count + ")";
+                                synchronized (lockObject) {
+                                    cacheFileFinal = new File(storePath, storeFileName);
+                                    int count = 1;
+                                    while (cacheFileFinal.exists()) {
+                                        int lastDotIndex = storeFileName.lastIndexOf('.');
+                                        String newFileName;
+                                        if (lastDotIndex > 0) {
+                                            newFileName = storeFileName.substring(0, lastDotIndex) + " (" + count + ")" + storeFileName.substring(lastDotIndex);
+                                        } else {
+                                            newFileName = storeFileName + " (" + count + ")";
+                                        }
+                                        cacheFileFinal = new File(storePath, newFileName);
+                                        count++;
                                     }
-                                    cacheFileFinal = new File(storePath, newFileName);
-                                    count++;
                                 }
                             }
                             renameResult = cacheFileTemp.renameTo(cacheFileFinal);
@@ -1290,17 +1312,18 @@ public class FileLoadOperation {
                             return;
                         }
                         cacheFileFinal = cacheFileTemp;
+                    } else {
+                        if (pathSaveData != null && cacheFileFinal.exists()) {
+                            delegate.saveFilePath(pathSaveData, cacheFileFinal);
+                        }
                     }
                 } else {
                     onFail(false, 0);
                     return;
                 }
-                if (pathSaveData != null && cacheFileFinal.exists()) {
-                    delegate.saveFilePath(pathSaveData, cacheFileFinal);
-                }
             }
             if (BuildVars.LOGS_ENABLED) {
-                FileLog.d("finished downloading file to " + cacheFileFinal);
+                FileLog.d("finished downloading file to " + cacheFileFinal + " time = " + (System.currentTimeMillis() - startTime));
             }
             if (increment) {
                 if (currentType == ConnectionsManager.FileTypeAudio) {
@@ -1423,8 +1446,8 @@ public class FileLoadOperation {
 
     protected boolean processRequestResult(RequestInfo requestInfo, TLRPC.TL_error error) {
         if (state != stateDownloading) {
-            if (BuildVars.DEBUG_VERSION) {
-                FileLog.d("trying to write to finished file " + cacheFileFinal + " offset " + requestInfo.offset);
+            if (BuildVars.DEBUG_VERSION && state == stateFinished) {
+                FileLog.e(new Exception("trying to write to finished file " + fileName + " offset " + requestInfo.offset + " " + totalBytesCount));
             }
             return false;
         }
@@ -1546,7 +1569,7 @@ public class FileLoadOperation {
                     if (notLoadedBytesRanges != null) {
                         fileOutputStream.seek(requestInfo.offset);
                         if (BuildVars.DEBUG_VERSION) {
-                            FileLog.d("save file part " + cacheFileFinal + " offset " + requestInfo.offset);
+                            FileLog.d("save file part " + fileName + " offset=" + requestInfo.offset + " chunk_size=" + currentDownloadChunkSize + " isCdn=" + isCdn);
                         }
                     }
                     FileChannel channel = fileOutputStream.getChannel();
@@ -1639,7 +1662,7 @@ public class FileLoadOperation {
 
                 if (finishedDownloading) {
                     onFinishLoadingFile(true);
-                } else {
+                } else if (state != stateCanceled){
                     startDownloadRequest();
                 }
             } catch (Exception e) {
@@ -1693,7 +1716,7 @@ public class FileLoadOperation {
 
     protected void onFail(boolean thread, final int reason) {
         cleanup();
-        state = stateFailed;
+        state = reason == 1 ? stateCanceled : stateFailed;
         if (delegate != null) {
             if (thread) {
                 Utilities.stageQueue.postRunnable(() -> delegate.didFailedLoadingFile(FileLoadOperation.this, reason));
